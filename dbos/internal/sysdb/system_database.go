@@ -452,6 +452,9 @@ var migration106SQL string
 //go:embed migrations/107_create_application_versions_unclaimed_index.sql
 var migration107SQL string
 
+//go:embed migrations/108_add_queue_partition_limits.sql
+var migration108SQL string
+
 type MigrationFile struct {
 	Version int64
 	SQL     string
@@ -617,6 +620,7 @@ func BuildMigrations(schema string, isCockroach bool) []MigrationFile {
 		{Version: 105, SQL: migration105SQLProcessed},
 		{Version: 106, SQL: fmt.Sprintf(migration106SQL, sanitizedSchema)},
 		{Version: 107, SQL: fmt.Sprintf(migration107SQL, c, sanitizedSchema), Online: !isCockroach},
+		{Version: 108, SQL: fmt.Sprintf(migration108SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 	}
 }
 
@@ -4795,20 +4799,27 @@ func (s *SysDB) debounceDelayedWorkflowInternal(ctx context.Context, tx Tx, inpu
 }
 
 type DequeueWorkflowsInput struct {
-	Queue              models.QueueConfig
-	ExecutorID         string
-	ApplicationVersion string
-	QueuePartitionKey  string
-	LocalRunningCount  int
+	Queue                      models.QueueConfig
+	ExecutorID                 string
+	ApplicationVersion         string
+	QueuePartitionKey          string
+	LocalRunningCount          int
+	PartitionLocalRunningCount int
 }
 
 // DequeueWorkflows claims enqueued workflows for this executor and returns their IDs,
 // in the order the queue selected them.
 func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInput) ([]string, error) {
-	// Snapshot isolation is only required for global concurrency or rate limiting.
-	// Otherwise read committed suffices: worker concurrency is enforced in-memory.
-	snapshot := input.Queue.GlobalConcurrency != nil || input.Queue.RateLimit != nil
-	tx, err := s.pool.BeginTx(ctx, TxOptions{IsoLevel: s.dialect.QueueDequeueIsolation(snapshot)})
+	limits := input.Queue.ResolveLimits()
+	queueWide := limits.GlobalConcurrency != nil || limits.RateLimit != nil
+	budget := DequeueBudgetLocal // read committed
+	switch {
+	case queueWide && input.QueuePartitionKey != "":
+		budget = DequeueBudgetCrossPartition // Global limits on a partitioned queue: serializable
+	case queueWide || limits.PartitionConcurrency != nil || limits.PartitionRateLimit != nil:
+		budget = DequeueBudgetShared // Global limits on a non-partitioned queue, or partition limits on a partitioned queue: repeatable read
+	}
+	tx, err := s.pool.BeginTx(ctx, TxOptions{IsoLevel: s.dialect.QueueDequeueIsolation(budget)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -4816,91 +4827,115 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 
 	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
 
-	// Rate limiter: count workflows started within the limiter period.
-	var numRecentQueries int
-	if input.Queue.RateLimit != nil {
-		cutoffTimeMs := time.Now().Add(-input.Queue.RateLimit.Period).UnixMilli()
-
-		limiterQuery := s.RenderSQL(`
+	rateLimitRemaining := func(limiter *models.RateLimiter, partitionScoped bool) (int, error) {
+		query := s.RenderSQL(`
 		SELECT COUNT(*)
 		FROM %sworkflow_status
 		WHERE queue_name = $1
 		  AND rate_limited = TRUE
 		  AND status NOT IN ($2, $3)
-		  AND started_at_epoch_ms > $4`, schemaPrefix)
+		  AND started_at_epoch_ms > `+s.dialect.NowMsSQL()+` - $4`, schemaPrefix)
 
-		limiterArgs := []any{input.Queue.Name, models.WorkflowStatusEnqueued, models.WorkflowStatusDelayed, cutoffTimeMs}
+		args := []any{input.Queue.Name, models.WorkflowStatusEnqueued, models.WorkflowStatusDelayed, limiter.Period.Milliseconds()}
 		if s.appName != "" {
-			limiterArgs = append(limiterArgs, s.appName)
-			limiterQuery += ` AND ` + nameFilterSQL("application_name", len(limiterArgs))
+			args = append(args, s.appName)
+			query += ` AND ` + nameFilterSQL("application_name", len(args))
 		}
-		if len(input.QueuePartitionKey) > 0 {
-			limiterArgs = append(limiterArgs, input.QueuePartitionKey)
-			limiterQuery += fmt.Sprintf(` AND queue_partition_key = $%d`, len(limiterArgs))
-		}
-
-		err := tx.QueryRow(ctx, s.dialect.RewriteQuery(limiterQuery), limiterArgs...).Scan(&numRecentQueries)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query rate limiter: %w", err)
+		if partitionScoped {
+			args = append(args, input.QueuePartitionKey)
+			query += fmt.Sprintf(` AND queue_partition_key = $%d`, len(args))
 		}
 
-		if numRecentQueries >= input.Queue.RateLimit.Limit {
-			return nil, nil
+		var recent int
+		if err := tx.QueryRow(ctx, s.dialect.RewriteQuery(query), args...).Scan(&recent); err != nil {
+			return 0, fmt.Errorf("failed to query rate limiter: %w", err)
 		}
+		return limiter.Limit - recent, nil
 	}
 
-	// Calculate max_tasks based on concurrency limits
-	// maxTasks < 0 means this dequeue is unbounded.
-	maxTasks := -1
-
-	if input.Queue.RateLimit != nil {
-		remaining_limit := input.Queue.RateLimit.Limit - numRecentQueries
-
-		if maxTasks < 0 || remaining_limit < maxTasks {
-			maxTasks = remaining_limit
-		}
-	}
-
-	if input.Queue.WorkerConcurrency != nil {
-		workerConcurrency := *input.Queue.WorkerConcurrency
-		if input.LocalRunningCount > workerConcurrency {
-			s.logger.Warn("Local running workflows on queue exceeds worker concurrency limit", "local_running", input.LocalRunningCount, "queue_name", input.Queue.Name, "concurrency_limit", workerConcurrency)
-		}
-		if available := max(workerConcurrency-input.LocalRunningCount, 0); maxTasks < 0 || available < maxTasks {
-			maxTasks = available
-		}
-	}
-
-	if input.Queue.GlobalConcurrency != nil {
-		pendingQuery := s.RenderSQL(`
+	pendingCount := func(partitionScoped bool) (int, error) {
+		query := s.RenderSQL(`
 			SELECT COUNT(*)
 			FROM %sworkflow_status
 			WHERE queue_name = $1 AND status = $2`, schemaPrefix)
 
-		pendingArgs := []any{input.Queue.Name, models.WorkflowStatusPending}
+		args := []any{input.Queue.Name, models.WorkflowStatusPending}
 		if s.appName != "" {
-			pendingArgs = append(pendingArgs, s.appName)
-			pendingQuery += ` AND ` + nameFilterSQL("application_name", len(pendingArgs))
+			args = append(args, s.appName)
+			query += ` AND ` + nameFilterSQL("application_name", len(args))
 		}
-		if len(input.QueuePartitionKey) > 0 {
-			pendingArgs = append(pendingArgs, input.QueuePartitionKey)
-			pendingQuery += fmt.Sprintf(` AND queue_partition_key = $%d`, len(pendingArgs))
-		}
-
-		var globalCount int
-		if err := tx.QueryRow(ctx, s.dialect.RewriteQuery(pendingQuery), pendingArgs...).Scan(&globalCount); err != nil {
-			return nil, fmt.Errorf("failed to query pending workflows: %w", err)
+		if partitionScoped {
+			args = append(args, input.QueuePartitionKey)
+			query += fmt.Sprintf(` AND queue_partition_key = $%d`, len(args))
 		}
 
-		concurrency := *input.Queue.GlobalConcurrency
-		if globalCount > concurrency {
-			s.logger.Warn("Total pending workflows on queue exceeds global concurrency limit", "total_pending", globalCount, "queue_name", input.Queue.Name, "concurrency_limit", concurrency)
+		var pending int
+		if err := tx.QueryRow(ctx, s.dialect.RewriteQuery(query), args...).Scan(&pending); err != nil {
+			return 0, fmt.Errorf("failed to query pending workflows: %w", err)
 		}
-		if availableTasks := max(concurrency-globalCount, 0); maxTasks < 0 || availableTasks < maxTasks {
-			maxTasks = availableTasks
+		return pending, nil
+	}
+
+	// maxTasks < 0 means this dequeue is unbounded.
+	maxTasks := -1
+	bound := func(available int) {
+		available = max(available, 0)
+		if maxTasks < 0 || available < maxTasks {
+			maxTasks = available
 		}
 	}
 
+	if limits.WorkerConcurrency != nil {
+		if input.LocalRunningCount > *limits.WorkerConcurrency {
+			s.logger.Warn("Local running workflows on queue exceeds worker concurrency limit", "local_running", input.LocalRunningCount, "queue_name", input.Queue.Name, "concurrency_limit", *limits.WorkerConcurrency)
+		}
+		bound(*limits.WorkerConcurrency - input.LocalRunningCount)
+	}
+	if limits.PartitionWorkerConcurrency != nil {
+		bound(*limits.PartitionWorkerConcurrency - input.PartitionLocalRunningCount)
+	}
+	if maxTasks == 0 {
+		return nil, nil
+	}
+
+	if limits.RateLimit != nil {
+		remaining, err := rateLimitRemaining(limits.RateLimit, false)
+		if err != nil {
+			return nil, err
+		}
+		bound(remaining)
+	}
+	if limits.PartitionRateLimit != nil {
+		remaining, err := rateLimitRemaining(limits.PartitionRateLimit, true)
+		if err != nil {
+			return nil, err
+		}
+		bound(remaining)
+	}
+	if maxTasks == 0 {
+		return nil, nil
+	}
+
+	if limits.GlobalConcurrency != nil {
+		pending, err := pendingCount(false)
+		if err != nil {
+			return nil, err
+		}
+		if pending > *limits.GlobalConcurrency {
+			s.logger.Warn("Total pending workflows on queue exceeds global concurrency limit", "total_pending", pending, "queue_name", input.Queue.Name, "concurrency_limit", *limits.GlobalConcurrency)
+		}
+		bound(*limits.GlobalConcurrency - pending)
+	}
+	if limits.PartitionConcurrency != nil {
+		pending, err := pendingCount(true)
+		if err != nil {
+			return nil, err
+		}
+		if pending > *limits.PartitionConcurrency {
+			s.logger.Warn("Total pending workflows on partition exceeds partition concurrency limit", "total_pending", pending, "queue_name", input.Queue.Name, "partition_key", input.QueuePartitionKey, "concurrency_limit", *limits.PartitionConcurrency)
+		}
+		bound(*limits.PartitionConcurrency - pending)
+	}
 	if maxTasks == 0 {
 		return nil, nil
 	}
@@ -4942,10 +4977,9 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 
 	query += ` ORDER BY priority ASC, created_at ASC`
 
-	// Without a global budget (rate limiting, global concurrency),
-	// use SKIP LOCKED to only select rows that can be locked.
+	// Without a shared budget, use SKIP LOCKED to only select rows that can be locked.
 	// With one, use NOWAIT so all processes see a consistent table.
-	if input.Queue.GlobalConcurrency == nil && input.Queue.RateLimit == nil {
+	if budget == DequeueBudgetLocal {
 		if lock := s.dialect.LockSkipLocked(); lock != "" {
 			query += " " + lock
 		}
@@ -4979,10 +5013,13 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 		}
 		dequeuedIDs = append(dequeuedIDs, workflowID)
 	}
-
-	if len(dequeuedIDs) > 0 {
-		s.logger.Debug("attempting to dequeue task(s)", "queue_name", input.Queue.Name, "num_tasks", len(dequeuedIDs))
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read enqueued workflows: %w", err)
 	}
+	if len(dequeuedIDs) == 0 {
+		return nil, nil
+	}
+	s.logger.Debug("attempting to dequeue task(s)", "queue_name", input.Queue.Name, "num_tasks", len(dequeuedIDs))
 
 	// Claim the candidates in one statement: flip them to PENDING and count the
 	// dispatch, claiming unclaimed rows for this application.
@@ -4992,13 +5029,14 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 		    application_name = COALESCE(application_name, $8)`
 		claimClause = ` AND ` + nameFilterSQL("application_name", 8)
 	}
+	nowMs := s.dialect.NowMsSQL()
 	updateQuery := s.RenderSQL(`
 		UPDATE %sworkflow_status
 		SET status = $1,
 		    application_version = $2,
 		    executor_id = $3,
-		    started_at_epoch_ms = $4,
-		    updated_at = $4,
+		    started_at_epoch_ms = `+nowMs+`,
+		    updated_at = `+nowMs+`,
 		    rate_limited = $5,
 		    recovery_attempts = recovery_attempts + 1,
 		    workflow_deadline_epoch_ms = CASE
@@ -5018,7 +5056,7 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 		input.ApplicationVersion,
 		input.ExecutorID,
 		time.Now().UnixMilli(),
-		input.Queue.RateLimit != nil,
+		limits.RateLimit != nil || limits.PartitionRateLimit != nil,
 		encodedIDs,
 		models.WorkflowStatusEnqueued,
 	}
@@ -5151,20 +5189,28 @@ func (s *SysDB) ReenqueueForRecovery(ctx context.Context, executorIDs []string, 
 
 // GetQueuePartitions returns all unique partition keys for enqueued workflows in a queue.
 func (s *SysDB) GetQueuePartitions(ctx context.Context, queueName string) ([]string, error) {
-	appNameClause := ""
 	args := []any{queueName, models.WorkflowStatusEnqueued}
+	filter := fmt.Sprintf(`queue_name = $1 AND status = $2 AND status IN ('%s', '%s')`, models.WorkflowStatusEnqueued, models.WorkflowStatusPending)
 	if s.appName != "" {
 		args = append(args, s.appName)
-		appNameClause = ` AND ` + nameFilterSQL("application_name", len(args))
+		filter += ` AND ` + nameFilterSQL("application_name", len(args))
 	}
-	query := s.RenderSQL(`
-		SELECT DISTINCT queue_partition_key
-		FROM %sworkflow_status
-		WHERE queue_name = $1
-		  AND status = $2
-		  AND queue_partition_key IS NOT NULL`+appNameClause, s.dialect.SchemaPrefix(s.schema))
+	// Recursive-CTE to perform one index seek per distinct key, so the cost scales
+	// with the number of partitions rather than the backlog depth.
+	// note: queue_partition_key > partitions.pk simulates "IS NOT NULL".
+	table := s.dialect.SchemaPrefix(s.schema) + "workflow_status"
+	query := `
+		WITH RECURSIVE partitions(pk) AS (
+			SELECT MIN(queue_partition_key) FROM ` + table + `
+			WHERE ` + filter + ` AND queue_partition_key IS NOT NULL
+			UNION ALL
+			SELECT (SELECT MIN(queue_partition_key) FROM ` + table + `
+			        WHERE ` + filter + ` AND queue_partition_key > partitions.pk)
+			FROM partitions WHERE partitions.pk IS NOT NULL
+		)
+		SELECT pk FROM partitions WHERE pk IS NOT NULL`
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := s.pool.Query(ctx, s.dialect.RewriteQuery(query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query queue partitions: %w", err)
 	}
@@ -5189,7 +5235,7 @@ func (s *SysDB) GetQueuePartitions(ctx context.Context, queueName string) ([]str
 /******* QUEUE REGISTRY ********/
 /*******************************/
 
-const _QUEUE_SELECT_COLUMNS = "name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, application_name"
+const _QUEUE_SELECT_COLUMNS = "name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, application_name, partition_concurrency, partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec"
 
 type UpsertQueueDBInput struct {
 	Queue           models.QueueConfig
@@ -5201,34 +5247,35 @@ type UpsertQueueDBInput struct {
 // _QUEUE_SELECT_COLUMNS, in order.
 func scanQueueRow(row Row) (*models.QueueConfig, error) {
 	var (
-		name                            string
-		concurrency, workerConcurrency  *int
-		rateLimitMax                    *int
-		rateLimitPeriodSec              *float64
-		priorityEnabled, partitionQueue bool
-		pollingIntervalSec              float64
-		applicationName                 *string
+		name                                             string
+		concurrency, workerConcurrency                   *int
+		rateLimitMax                                     *int
+		rateLimitPeriodSec                               *float64
+		priorityEnabled, partitionQueue                  bool
+		pollingIntervalSec                               float64
+		applicationName                                  *string
+		partitionConcurrency, partitionWorkerConcurrency *int
+		partitionRateLimitMax                            *int
+		partitionRateLimitPeriodSec                      *float64
 	)
-	if err := row.Scan(&name, &concurrency, &workerConcurrency, &rateLimitMax, &rateLimitPeriodSec, &priorityEnabled, &partitionQueue, &pollingIntervalSec, &applicationName); err != nil {
+	if err := row.Scan(&name, &concurrency, &workerConcurrency, &rateLimitMax, &rateLimitPeriodSec, &priorityEnabled, &partitionQueue, &pollingIntervalSec, &applicationName,
+		&partitionConcurrency, &partitionWorkerConcurrency, &partitionRateLimitMax, &partitionRateLimitPeriodSec); err != nil {
 		return nil, err
 	}
 	q := &models.QueueConfig{
-		Name:              name,
-		GlobalConcurrency: concurrency,
-		WorkerConcurrency: workerConcurrency,
-		PriorityEnabled:   priorityEnabled,
-		PartitionQueue:    partitionQueue,
-		DatabaseBacked:    true,
+		Name:                       name,
+		GlobalConcurrency:          concurrency,
+		WorkerConcurrency:          workerConcurrency,
+		PriorityEnabled:            priorityEnabled,
+		PartitionQueue:             partitionQueue,
+		PartitionConcurrency:       partitionConcurrency,
+		PartitionWorkerConcurrency: partitionWorkerConcurrency,
+		RateLimit:                  rateLimitFromColumns(rateLimitMax, rateLimitPeriodSec),
+		PartitionRateLimit:         rateLimitFromColumns(partitionRateLimitMax, partitionRateLimitPeriodSec),
+		DatabaseBacked:             true,
 	}
 	if applicationName != nil {
 		q.ApplicationName = *applicationName
-	}
-	if rateLimitMax != nil {
-		var period time.Duration
-		if rateLimitPeriodSec != nil {
-			period = time.Duration(*rateLimitPeriodSec * float64(time.Second))
-		}
-		q.RateLimit = &models.RateLimiter{Limit: *rateLimitMax, Period: period}
 	}
 	base := time.Duration(pollingIntervalSec * float64(time.Second))
 	if base <= 0 {
@@ -5236,6 +5283,27 @@ func scanQueueRow(row Row) (*models.QueueConfig, error) {
 	}
 	q.BasePollingInterval = base
 	return q, nil
+}
+
+// rateLimitFromColumns decodes a (max, period_sec) column pair; a NULL max means no limiter.
+func rateLimitFromColumns(max *int, periodSec *float64) *models.RateLimiter {
+	if max == nil {
+		return nil
+	}
+	var period time.Duration
+	if periodSec != nil {
+		period = time.Duration(*periodSec * float64(time.Second))
+	}
+	return &models.RateLimiter{Limit: *max, Period: period}
+}
+
+// rateLimitToColumns encodes a limiter as its (max, period_sec) column pair; nil encodes as NULLs.
+func rateLimitToColumns(rl *models.RateLimiter) (*int, *float64) {
+	if rl == nil {
+		return nil, nil
+	}
+	sec := rl.Period.Seconds()
+	return &rl.Limit, &sec
 }
 
 // GetQueue returns the database-backed queue with the given name, or nil (with a
@@ -5303,13 +5371,8 @@ func (s *SysDB) DeleteQueue(ctx context.Context, name string) error {
 // existing configuration. It returns true iff a new row was inserted.
 func (s *SysDB) UpsertQueue(ctx context.Context, input UpsertQueueDBInput) (bool, error) {
 	q := input.Queue
-	var rateLimitMax *int
-	var rateLimitPeriodSec *float64
-	if q.RateLimit != nil {
-		rateLimitMax = &q.RateLimit.Limit
-		sec := q.RateLimit.Period.Seconds()
-		rateLimitPeriodSec = &sec
-	}
+	rateLimitMax, rateLimitPeriodSec := rateLimitToColumns(q.RateLimit)
+	partitionRateLimitMax, partitionRateLimitPeriodSec := rateLimitToColumns(q.PartitionRateLimit)
 	pollingSec := q.BasePollingInterval.Seconds()
 	if pollingSec <= 0 {
 		pollingSec = models.DefaultBasePollingInterval.Seconds()
@@ -5331,11 +5394,13 @@ func (s *SysDB) UpsertQueue(ctx context.Context, input UpsertQueueDBInput) (bool
 	// Supply queue_id and created_at explicitly: the SQLite schema has no
 	// defaults for them (only the Postgres schema does).
 	insertQuery := s.RenderSQL(`INSERT INTO %squeues
-		(queue_id, name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, created_at, updated_at, application_name)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		(queue_id, name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, created_at, updated_at, application_name,
+		 partition_concurrency, partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (name) DO NOTHING`, schemaPrefix)
 	res, err := tx.Exec(ctx, s.dialect.RewriteQuery(insertQuery),
-		uuid.New().String(), q.Name, q.GlobalConcurrency, q.WorkerConcurrency, rateLimitMax, rateLimitPeriodSec, q.PriorityEnabled, q.PartitionQueue, pollingSec, nowMs, nowMs, owner)
+		uuid.New().String(), q.Name, q.GlobalConcurrency, q.WorkerConcurrency, rateLimitMax, rateLimitPeriodSec, q.PriorityEnabled, q.PartitionQueue, pollingSec, nowMs, nowMs, owner,
+		q.PartitionConcurrency, q.PartitionWorkerConcurrency, partitionRateLimitMax, partitionRateLimitPeriodSec)
 	if err != nil {
 		return false, fmt.Errorf("failed to insert queue %s: %w", q.Name, err)
 	}
@@ -5379,7 +5444,8 @@ func (s *SysDB) UpsertQueue(ctx context.Context, input UpsertQueueDBInput) (bool
 func (s *SysDB) updateQueueQuery(schemaPrefix string) string {
 	return s.RenderSQL(`UPDATE %squeues SET
 		concurrency = $2, worker_concurrency = $3, rate_limit_max = $4, rate_limit_period_sec = $5,
-		priority_enabled = $6, partition_queue = $7, polling_interval_sec = $8, updated_at = $9
+		priority_enabled = $6, partition_queue = $7, polling_interval_sec = $8, updated_at = $9,
+		partition_concurrency = $10, partition_worker_concurrency = $11, partition_rate_limit_max = $12, partition_rate_limit_period_sec = $13
 		WHERE name = $1`, schemaPrefix)
 }
 
@@ -5387,13 +5453,8 @@ func (s *SysDB) updateQueueQuery(schemaPrefix string) string {
 // using the given Querier (a pool or a transaction). It returns an error if no
 // row with the queue's name exists.
 func (s *SysDB) updateQueueRow(ctx context.Context, db Querier, q models.QueueConfig) error {
-	var rateLimitMax *int
-	var rateLimitPeriodSec *float64
-	if q.RateLimit != nil {
-		rateLimitMax = &q.RateLimit.Limit
-		sec := q.RateLimit.Period.Seconds()
-		rateLimitPeriodSec = &sec
-	}
+	rateLimitMax, rateLimitPeriodSec := rateLimitToColumns(q.RateLimit)
+	partitionRateLimitMax, partitionRateLimitPeriodSec := rateLimitToColumns(q.PartitionRateLimit)
 	pollingSec := q.BasePollingInterval.Seconds()
 	if pollingSec <= 0 {
 		pollingSec = models.DefaultBasePollingInterval.Seconds()
@@ -5402,7 +5463,8 @@ func (s *SysDB) updateQueueRow(ctx context.Context, db Querier, q models.QueueCo
 	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
 
 	res, err := db.Exec(ctx, s.dialect.RewriteQuery(s.updateQueueQuery(schemaPrefix)),
-		q.Name, q.GlobalConcurrency, q.WorkerConcurrency, rateLimitMax, rateLimitPeriodSec, q.PriorityEnabled, q.PartitionQueue, pollingSec, nowMs)
+		q.Name, q.GlobalConcurrency, q.WorkerConcurrency, rateLimitMax, rateLimitPeriodSec, q.PriorityEnabled, q.PartitionQueue, pollingSec, nowMs,
+		q.PartitionConcurrency, q.PartitionWorkerConcurrency, partitionRateLimitMax, partitionRateLimitPeriodSec)
 	if err != nil {
 		return fmt.Errorf("failed to update queue %s: %w", q.Name, err)
 	}

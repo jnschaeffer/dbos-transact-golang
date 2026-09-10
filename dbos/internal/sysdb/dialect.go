@@ -29,9 +29,9 @@ import (
 //     placeholders and a "%s" schema-prefix slot rendered via fmt.Sprintf.
 //     SQLite-flavor methods that diverge enough call dialect.RewriteQuery to
 //     convert $N → ?
-//   - SQL-level functions that don't exist in SQLite (gen_random_uuid,
-//     now()-epoch math) are not used in canonical queries; Go callers supply
-//     explicit values (uuid.NewString(), time.Now().UnixMilli()).
+//   - SQL-level functions that don't exist in SQLite (gen_random_uuid) are not
+//     used in canonical queries; Go callers supply explicit values. The database
+//     clock is the exception: NowMsSQL renders it per dialect.
 
 // DialectName identifies the backend. Stable string suitable for logging.
 type DialectName string
@@ -64,15 +64,16 @@ type Dialect interface {
 	// LockNoWait returns the "FOR UPDATE NOWAIT" fragment, or "".
 	LockNoWait() string
 
+	// NowMsSQL returns an expression for the database clock in epoch milliseconds.
+	NowMsSQL() string
+
 	// SnapshotIsolation returns the IsoLevel to request when a transaction
 	// needs snapshot-style semantics for queue dequeue. Postgres returns
 	// RepeatableRead; SQLite returns Default (the IMMEDIATE BEGIN handles it).
 	SnapshotIsolation() IsoLevel
 
-	// QueueDequeueIsolation returns the IsoLevel for the queue dequeue
-	// transaction. snapshot=true requests snapshot semantics
-	// snapshot=false allows the lighter read-committed path.
-	QueueDequeueIsolation(snapshot bool) IsoLevel
+	// QueueDequeueIsolation returns the IsoLevel for the queue dequeue transaction.
+	QueueDequeueIsolation(budget DequeueBudget) IsoLevel
 
 	// SupportsListenNotify reports whether the dialect supports
 	// LISTEN/NOTIFY. False for CockroachDB and SQLite, which both fall back
@@ -123,6 +124,15 @@ type Dialect interface {
 	// method value drops into the retry condition chain directly.
 	IsRetryableTransaction(err error, logger *slog.Logger) bool
 }
+
+// DequeueBudget is what a dequeue shares with other sweeps, which sets its isolation.
+type DequeueBudget int
+
+const (
+	DequeueBudgetLocal DequeueBudget = iota
+	DequeueBudgetShared
+	DequeueBudgetCrossPartition
+)
 
 // DetectDialect identifies the backend from a DBOS database URL by parsing
 // the scheme.
@@ -197,9 +207,13 @@ func (PostgresDialect) SchemaPrefix(schema string) string {
 func (PostgresDialect) RewriteQuery(q string) string { return q }
 func (PostgresDialect) LockSkipLocked() string       { return "FOR UPDATE SKIP LOCKED" }
 func (PostgresDialect) LockNoWait() string           { return "FOR UPDATE NOWAIT" }
+func (PostgresDialect) NowMsSQL() string             { return "(EXTRACT(EPOCH FROM now()) * 1000)::bigint" }
 func (PostgresDialect) SnapshotIsolation() IsoLevel  { return IsoLevelRepeatableRead }
-func (PostgresDialect) QueueDequeueIsolation(snapshot bool) IsoLevel {
-	if snapshot {
+func (PostgresDialect) QueueDequeueIsolation(budget DequeueBudget) IsoLevel {
+	switch budget {
+	case DequeueBudgetCrossPartition:
+		return IsoLevelSerializable
+	case DequeueBudgetShared:
 		return IsoLevelRepeatableRead
 	}
 	return IsoLevelReadCommitted
@@ -344,14 +358,18 @@ func (SqliteDialect) RewriteQuery(q string) string {
 	return sqlitePlaceholderRe.ReplaceAllString(q, "?$1")
 }
 
-func (SqliteDialect) LockSkipLocked() string                { return "" }
-func (SqliteDialect) LockNoWait() string                    { return "" }
-func (SqliteDialect) SnapshotIsolation() IsoLevel           { return IsoLevelDefault }
-func (SqliteDialect) QueueDequeueIsolation(_ bool) IsoLevel { return IsoLevelDefault }
-func (SqliteDialect) SupportsListenNotify() bool            { return false }
-func (SqliteDialect) SupportsArrayParameters() bool         { return false }
-func (SqliteDialect) SupportsDataModifyingCTE() bool        { return false }
-func (SqliteDialect) SupportsAttributesContainment() bool   { return false }
+func (SqliteDialect) LockSkipLocked() string { return "" }
+func (SqliteDialect) LockNoWait() string     { return "" }
+func (SqliteDialect) NowMsSQL() string {
+	// julianday keeps millisecond precision on every SQLite version, unlike unixepoch('subsec') (3.42+).
+	return "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+}
+func (SqliteDialect) SnapshotIsolation() IsoLevel                  { return IsoLevelDefault }
+func (SqliteDialect) QueueDequeueIsolation(DequeueBudget) IsoLevel { return IsoLevelDefault }
+func (SqliteDialect) SupportsListenNotify() bool                   { return false }
+func (SqliteDialect) SupportsArrayParameters() bool                { return false }
+func (SqliteDialect) SupportsDataModifyingCTE() bool               { return false }
+func (SqliteDialect) SupportsAttributesContainment() bool          { return false }
 
 // Classify sqlite errors via the registered driver's ErrorCode extractor
 // (see sqlite_driver.go). The extracted value is the extended result code

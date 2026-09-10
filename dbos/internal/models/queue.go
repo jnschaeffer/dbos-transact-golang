@@ -45,14 +45,61 @@ func (r *RateLimiter) UnmarshalJSON(data []byte) error {
 // QueueConfig is the persisted configuration of a workflow queue, as stored in
 // the queues table.
 type QueueConfig struct {
-	Name                string        `json:"name"`
-	WorkerConcurrency   *int          `json:"worker_concurrency,omitempty"`
-	GlobalConcurrency   *int          `json:"concurrency,omitempty"`
-	PriorityEnabled     bool          `json:"priority_enabled,omitempty"`
-	RateLimit           *RateLimiter  `json:"rate_limit,omitempty"`
-	PartitionQueue      bool          `json:"partition_queue,omitempty"`
-	BasePollingInterval time.Duration `json:"-"`
-	MaxPollingInterval  time.Duration `json:"-"`
-	DatabaseBacked      bool          `json:"-"`
-	ApplicationName     string        `json:"application_name,omitempty"`
+	Name                       string        `json:"name"`
+	WorkerConcurrency          *int          `json:"worker_concurrency,omitempty"`
+	GlobalConcurrency          *int          `json:"concurrency,omitempty"`
+	PriorityEnabled            bool          `json:"priority_enabled,omitempty"`
+	RateLimit                  *RateLimiter  `json:"rate_limit,omitempty"`
+	PartitionQueue             bool          `json:"partition_queue,omitempty"`
+	PartitionConcurrency       *int          `json:"partition_concurrency,omitempty"`
+	PartitionWorkerConcurrency *int          `json:"partition_worker_concurrency,omitempty"`
+	PartitionRateLimit         *RateLimiter  `json:"partition_rate_limit,omitempty"`
+	BasePollingInterval        time.Duration `json:"-"`
+	MaxPollingInterval         time.Duration `json:"-"`
+	DatabaseBacked             bool          `json:"-"`
+	ApplicationName            string        `json:"application_name,omitempty"`
+}
+
+// ResolvedQueueLimits holds every limit on a queue at the scope it is enforced at.
+type ResolvedQueueLimits struct {
+	GlobalConcurrency          *int
+	WorkerConcurrency          *int
+	RateLimit                  *RateLimiter
+	PartitionConcurrency       *int
+	PartitionWorkerConcurrency *int
+	PartitionRateLimit         *RateLimiter
+}
+
+// HasPartitionLimits reports whether any per-partition limit is set.
+func (q QueueConfig) HasPartitionLimits() bool {
+	return q.PartitionConcurrency != nil || q.PartitionWorkerConcurrency != nil || q.PartitionRateLimit != nil
+}
+
+// IsPartitioned reports whether the queue dequeues per partition key.
+func (q QueueConfig) IsPartitioned() bool {
+	return q.PartitionQueue || q.HasPartitionLimits()
+}
+
+// IsLegacyPartitioned reports the deprecated mode where the queue-wide limits apply per partition.
+func (q QueueConfig) IsLegacyPartitioned() bool {
+	return q.PartitionQueue && !q.HasPartitionLimits()
+}
+
+// ResolveLimits maps each limit to the scope it is enforced at.
+func (q QueueConfig) ResolveLimits() ResolvedQueueLimits {
+	if q.IsLegacyPartitioned() {
+		return ResolvedQueueLimits{
+			PartitionConcurrency:       q.GlobalConcurrency,
+			PartitionWorkerConcurrency: q.WorkerConcurrency,
+			PartitionRateLimit:         q.RateLimit,
+		}
+	}
+	return ResolvedQueueLimits{
+		GlobalConcurrency:          q.GlobalConcurrency,
+		WorkerConcurrency:          q.WorkerConcurrency,
+		RateLimit:                  q.RateLimit,
+		PartitionConcurrency:       q.PartitionConcurrency,
+		PartitionWorkerConcurrency: q.PartitionWorkerConcurrency,
+		PartitionRateLimit:         q.PartitionRateLimit,
+	}
 }
