@@ -403,9 +403,11 @@ func (c *dbosContext) Value(key any) any {
 func (c *dbosContext) clone(ctx context.Context) *dbosContext {
 	childCtx := &dbosContext{
 		ctx:                     ctx,
+		ctxCancelFunc:           c.ctxCancelFunc,
 		config:                  c.config,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		workflowScheduler:       c.workflowScheduler,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
